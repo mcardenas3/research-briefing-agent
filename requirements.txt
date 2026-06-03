@@ -1,0 +1,6 @@
+anthropic
+firecrawl-py
+reportlab
+requests
+pypdf
+python-dotenv

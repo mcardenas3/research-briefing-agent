@@ -1,0 +1,155 @@
+name: Daily Research Briefing
+
+on:
+  schedule:
+    - cron: "0 8 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  research-briefing:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # ── Set up run folder ────────────────────────────────────────────────────
+      - name: Set up run folder
+        id: setup
+        run: |
+          RUN=".tmp/run_$(date -u +%Y-%m-%d_%H%M%S)"
+          mkdir -p "$RUN"
+          echo "run_folder=$RUN" >> $GITHUB_OUTPUT
+          echo "run_date=$(date -u +%Y-%m-%d)" >> $GITHUB_OUTPUT
+
+      # ── Step 0: Parse proposal ───────────────────────────────────────────────
+      - name: Step 0 — Parse proposal
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          echo "CURRENT_STEP=Step 0 - Parse Proposal" >> $GITHUB_ENV
+          python tools/parse_proposal.py \
+            --output "${{ steps.setup.outputs.run_folder }}/proposal_context.json"
+
+      # ── Step 1: Search papers ────────────────────────────────────────────────
+      - name: Step 1 — Search papers
+        run: |
+          echo "CURRENT_STEP=Step 1 - Search Papers" >> $GITHUB_ENV
+          python tools/search_papers.py \
+            --context "${{ steps.setup.outputs.run_folder }}/proposal_context.json" \
+            --output  "${{ steps.setup.outputs.run_folder }}/papers_raw.json" \
+            --total 18
+
+      # ── Filter seen papers ───────────────────────────────────────────────────
+      # Removes papers already sent in a previous briefing.
+      # Writes new_count to GITHUB_OUTPUT; subsequent steps are skipped if 0.
+      - name: Filter seen papers
+        id: filter
+        run: |
+          echo "CURRENT_STEP=Filter Seen Papers" >> $GITHUB_ENV
+          python tools/filter_seen_papers.py \
+            --mode filter \
+            --input   "${{ steps.setup.outputs.run_folder }}/papers_raw.json" \
+            --seen    seen_papers.json \
+            --run-dir "${{ steps.setup.outputs.run_folder }}"
+
+      # ── Early exit: no new papers ─────────────────────────────────────────────
+      - name: Send no-new-papers email
+        if: steps.filter.outputs.new_count == '0'
+        env:
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+        run: |
+          python tools/send_email.py \
+            --mode no-new-papers \
+            --date "${{ steps.setup.outputs.run_date }}"
+
+      # ── Step 2: Enrich with full text ────────────────────────────────────────
+      - name: Step 2 — Enrich with full text (Firecrawl)
+        if: steps.filter.outputs.new_count != '0'
+        env:
+          FIRECRAWL_API_KEY: ${{ secrets.FIRECRAWL_API_KEY }}
+        run: |
+          echo "CURRENT_STEP=Step 2 - Enrich with Full Text" >> $GITHUB_ENV
+          python tools/scrape_paper_content.py \
+            --input  "${{ steps.setup.outputs.run_folder }}/papers_raw.json" \
+            --output "${{ steps.setup.outputs.run_folder }}/papers_enriched.json"
+
+      # ── Step 3: Summarize and organize ───────────────────────────────────────
+      - name: Step 3 — Summarize and organize
+        if: steps.filter.outputs.new_count != '0'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          echo "CURRENT_STEP=Step 3 - Summarize and Organize" >> $GITHUB_ENV
+          python tools/summarize_and_organize.py \
+            --input   "${{ steps.setup.outputs.run_folder }}/papers_enriched.json" \
+            --context "${{ steps.setup.outputs.run_folder }}/proposal_context.json" \
+            --output  "${{ steps.setup.outputs.run_folder }}/papers_summarized.json"
+
+      # ── Step 5: Generate PDF ─────────────────────────────────────────────────
+      - name: Step 5 — Generate PDF
+        if: steps.filter.outputs.new_count != '0'
+        run: |
+          echo "CURRENT_STEP=Step 5 - Generate PDF" >> $GITHUB_ENV
+          python tools/generate_pdf.py \
+            --input   "${{ steps.setup.outputs.run_folder }}/papers_summarized.json" \
+            --context "${{ steps.setup.outputs.run_folder }}/proposal_context.json" \
+            --output  "${{ steps.setup.outputs.run_folder }}/research_digest_${{ steps.setup.outputs.run_date }}.pdf"
+
+      # ── Update seen_papers.json and commit ───────────────────────────────────
+      - name: Update seen papers memory
+        if: steps.filter.outputs.new_count != '0' && success()
+        run: |
+          python tools/filter_seen_papers.py \
+            --mode update \
+            --seen    seen_papers.json \
+            --run-dir "${{ steps.setup.outputs.run_folder }}"
+
+      - name: Commit seen_papers.json
+        if: steps.filter.outputs.new_count != '0' && success()
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add seen_papers.json
+          git diff --staged --quiet || git commit -m "chore: update seen_papers.json [$(date -u +%Y-%m-%d)]"
+          git push
+
+      # ── Send success email ───────────────────────────────────────────────────
+      - name: Send briefing email
+        if: steps.filter.outputs.new_count != '0' && success()
+        env:
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+        run: |
+          python tools/send_email.py \
+            --mode success \
+            --run-dir "${{ steps.setup.outputs.run_folder }}" \
+            --date    "${{ steps.setup.outputs.run_date }}"
+
+      # ── Failure fallback ─────────────────────────────────────────────────────
+      # Runs on any pipeline failure; CURRENT_STEP tells which step broke.
+      - name: Send failure notification
+        if: failure()
+        env:
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+        run: |
+          python tools/send_email.py \
+            --mode failure \
+            --failed-step "${{ env.CURRENT_STEP }}" \
+            --date        "${{ steps.setup.outputs.run_date }}"
